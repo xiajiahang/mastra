@@ -909,6 +909,80 @@ describe('TrackingExporter', () => {
     });
   });
 
+  describe('Hard-cap cleanup during lifecycle operations', () => {
+    it.each([
+      ['flush', false],
+      ['shutdown', false],
+      ['flush', true],
+      ['shutdown', true],
+    ] as const)('waits for hard-cap cleanup during %s (failure: %s)', async (operation, failAbort) => {
+      let releaseAbort!: () => void;
+      const pendingAbort = new Promise<void>(resolve => {
+        releaseAbort = resolve;
+      });
+      let startAbort!: () => void;
+      const abortStarted = new Promise<void>(resolve => {
+        startAbort = resolve;
+      });
+      const hooks: string[] = [];
+      class DelayedCapExporter extends TestTrackingExporter {
+        protected override async _abortSpan(args: {
+          span: TestSpanData;
+          traceData: TestTraceData;
+          reason: SpanErrorInfo;
+        }): Promise<void> {
+          if (args.reason.id === 'TRACE_CAP_EXCEEDED') {
+            startAbort();
+            await pendingAbort;
+            if (failAbort) throw new Error('Cap abort failed');
+          }
+          await super._abortSpan(args);
+        }
+        protected override async _flush(): Promise<void> {
+          hooks.push('flush');
+        }
+        protected override async _postShutdown(): Promise<void> {
+          hooks.push('shutdown');
+        }
+      }
+      exporter = new DelayedCapExporter({ maxTotalTraces: 1 });
+      for (const id of ['old-root', 'new-root']) {
+        await exporter.exportTracingEvent({
+          type: 'span_started',
+          exportedSpan: {
+            id,
+            traceId: id,
+            name: id,
+            type: SpanType.AGENT_RUN,
+            isRootSpan: true,
+            isEvent: false,
+            startTime: new Date(),
+          },
+        });
+      }
+      await abortStarted;
+      let finished = false;
+      const completing = exporter[operation]().then(() => {
+        finished = true;
+      });
+      try {
+        await Promise.race([completing, flushAsync()]);
+        expect(finished).toBe(false);
+        expect(hooks).toEqual([]);
+      } finally {
+        releaseAbort();
+        await completing;
+      }
+      expect(hooks).toEqual([operation]);
+      if (!failAbort) {
+        expect(exporter.calls.filter(call => call.method === '_abortSpan' && call.spanId === 'old-root')).toHaveLength(
+          1,
+        );
+        expect(exporter.abortedSpans.get('old-root')?.id).toBe('TRACE_CAP_EXCEEDED');
+      }
+    });
+  });
+
   describe('Shutdown behavior', () => {
     it('should cancel pending cleanups on shutdown', async () => {
       exporter = new TestTrackingExporter({

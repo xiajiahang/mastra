@@ -490,6 +490,8 @@ export abstract class TrackingExporter<
   #pendingCleanups = new Map<string, ReturnType<typeof setTimeout>>();
   /** Waiting-queue replays started by setImmediate that haven't finished yet */
   #activeReplays = new Set<Promise<void>>();
+  /** Background cap cleanup that must finish before vendor queues are flushed. */
+  #activeHardCapEnforcements = new Set<Promise<void>>();
   // Note: #traceMap maintains insertion order (JS Map spec), so we use
   // #traceMap.keys() to iterate traces oldest-first for cap enforcement.
 
@@ -1316,11 +1318,20 @@ export abstract class TrackingExporter<
       });
 
       // Enforce hard cap on total traces
-      this.#enforceHardCap().catch(error => {
-        this.logger.error(`${this.name}: Error enforcing hard cap`, { error });
-      });
+      const enforcement = this.#enforceHardCap()
+        .catch(error => {
+          this.logger.error(`${this.name}: Error enforcing hard cap`, { error });
+        })
+        .finally(() => this.#activeHardCapEnforcements.delete(enforcement));
+      this.#activeHardCapEnforcements.add(enforcement);
     }
     return this.#traceMap.get(traceId)!;
+  }
+
+  async #drainHardCapEnforcements(): Promise<void> {
+    while (this.#activeHardCapEnforcements.size > 0) {
+      await Promise.all(this.#activeHardCapEnforcements);
+    }
   }
 
   /**
@@ -1363,6 +1374,7 @@ export abstract class TrackingExporter<
     if (!this.#shutdownStarted) {
       await this.#drainWaitingQueues();
     }
+    await this.#drainHardCapEnforcements();
     await this._flush();
   }
 
@@ -1391,6 +1403,7 @@ export abstract class TrackingExporter<
     // Finish replaying queued events that can still be processed, so spans that
     // already ended aren't aborted below
     await this.#drainWaitingQueues();
+    await this.#drainHardCapEnforcements();
     await this._preShutdown();
 
     // Cancel all pending cleanup timers
